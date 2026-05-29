@@ -3,7 +3,11 @@ import express from 'express';
 import axios from 'axios';
 import qrcode from 'qrcode';
 import pino from 'pino';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { 
+  useMultiFileAuthState, 
+  DisconnectReason,
+  fetchLatestBaileysVersion 
+} from '@whiskeysockets/baileys';
 import { existsSync, mkdirSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -19,35 +23,29 @@ const API_KEY = process.env.API_KEY || 'CHANGE_THIS_NODE_API_KEY';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'CHANGE_THIS_WEBHOOK_SECRET';
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 
-// टाइपिंग और रिप्लाई की देरी (सेकंड में)
-const TYPING_DURATION = parseInt(process.env.TYPING_DURATION) || 2000;  // 2 सेकंड टाइपिंग
-const PAUSE_DURATION = parseInt(process.env.PAUSE_DURATION) || 1000;   // 1 सेकंड पॉज़
-const REPLY_DELAY = parseInt(process.env.REPLY_DELAY) || 3000;         // 3 सेकंड टोटल देरी
+const TYPING_DURATION = parseInt(process.env.TYPING_DURATION) || 2000;
+const PAUSE_DURATION = parseInt(process.env.PAUSE_DURATION) || 1000;
+const REPLY_DELAY = parseInt(process.env.REPLY_DELAY) || 3000;
 
-// Session directory बनाएं
 if (!existsSync(SESSIONS_DIR)) mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// सभी sessions store करें
 const sessions = new Map();
 
 // ========== HELPER FUNCTIONS ==========
 
-// देरी के लिए function
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// टाइपिंग इंडिकेटर दिखाने के लिए
 async function showTyping(socket, jid) {
   try {
-    await socket.sendPresenceUpdate('composing', jid);  // टाइपिंग शुरू
-    await delay(TYPING_DURATION);                       // टाइपिंग दिखाएं
-    await socket.sendPresenceUpdate('paused', jid);     // टाइपिंग बंद
-    await delay(PAUSE_DURATION);                        // थोड़ा रुकें
+    await socket.sendPresenceUpdate('composing', jid);
+    await delay(TYPING_DURATION);
+    await socket.sendPresenceUpdate('paused', jid);
+    await delay(PAUSE_DURATION);
   } catch (error) {
     logger.warn({ error: error.message }, 'Typing indicator failed');
   }
 }
 
-// API Key check middleware
 function requireApiKey(req, res, next) {
   const key = req.headers['x-api-key'];
   if (key !== API_KEY) {
@@ -56,7 +54,6 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// Status notify करें
 async function notifyStatus(sessionId, status) {
   const session = sessions.get(sessionId);
   if (!session?.statusCallbackUrl) return;
@@ -82,15 +79,16 @@ async function startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCal
   if (!existsSync(sessionPath)) mkdirSync(sessionPath, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  const { version } = await fetchLatestBaileysVersion();
   
   const sock = makeWASocket({
+    version,
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
     browser: ['WhatsAppBot', 'Chrome', '1.0.0']
   });
 
-  // Session store करें
   sessions.set(sessionId, {
     socket: sock,
     status: 'pending',
@@ -105,7 +103,6 @@ async function startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCal
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // QR Code generate हुआ
     if (qr) {
       const qrDataUrl = await qrcode.toDataURL(qr);
       const session = sessions.get(sessionId);
@@ -117,24 +114,32 @@ async function startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCal
       logger.info({ sessionId }, 'QR Code generated');
     }
 
-    // Connection close हुआ
     if (connection === 'close') {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      // बिना Boom के statusCode निकालें
+      let statusCode = null;
+      if (lastDisconnect?.error) {
+        statusCode = lastDisconnect.error?.output?.statusCode || 
+                     lastDisconnect.error?.statusCode ||
+                     (lastDisconnect.error?.message ? 500 : null);
+      }
       
-      if (reason === DisconnectReason.loggedOut) {
+      // Check for logged out
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut ||
+                         lastDisconnect?.error?.message?.includes('logged out');
+      
+      if (isLoggedOut) {
         logger.info({ sessionId }, 'Session logged out');
         const session = sessions.get(sessionId);
         if (session) session.status = 'disconnected';
         notifyStatus(sessionId, 'disconnected');
-      } else if (reason !== DisconnectReason.connectionReplaced) {
-        logger.info({ sessionId }, 'Reconnecting...');
+      } else if (statusCode !== DisconnectReason.connectionReplaced) {
+        logger.info({ sessionId, statusCode }, 'Reconnecting...');
         setTimeout(() => {
           startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCallbackUrl);
         }, 3000);
       }
     }
 
-    // Connected!
     if (connection === 'open') {
       logger.info({ sessionId }, 'WhatsApp connected successfully');
       const session = sessions.get(sessionId);
@@ -147,10 +152,9 @@ async function startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCal
     }
   });
 
-  // Credentials save करें
   sock.ev.on('creds.update', saveCreds);
 
-  // ========== MESSAGE HANDLER WITH TYPING SIMULATION ==========
+  // Message Handler with Typing Simulation
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     
@@ -158,10 +162,8 @@ async function startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCal
     if (!session || session.status !== 'connected') return;
 
     for (const msg of messages) {
-      // Skip if message is from me or no content
       if (msg.key.fromMe || !msg.message) continue;
 
-      // Message text extract करें
       const text = msg.message.conversation || 
                    msg.message.extendedTextMessage?.text || '';
       
@@ -173,13 +175,13 @@ async function startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCal
       logger.info({ sessionId, from: senderPhone, text }, 'Message received');
 
       try {
-        // ⭐ Step 1: Show typing indicator
+        // Show typing indicator
         await showTyping(sock, senderJid);
         
-        // ⭐ Step 2: Wait before reply (3 seconds)
+        // Wait before reply
         await delay(REPLY_DELAY);
 
-        // ⭐ Step 3: Call your .NET webhook
+        // Call webhook
         const response = await axios.post(session.callbackUrl, {
           recipientPhoneNumber: session.tenantPhoneNumber,
           senderPhoneNumber: `+${senderPhone}`,
@@ -194,21 +196,19 @@ async function startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCal
           timeout: 15000
         });
 
-        // ⭐ Step 4: Send reply
         const reply = response.data?.answer || response.data?.reply || response.data?.message;
         if (reply) {
           await sock.sendMessage(senderJid, { text: reply });
-          logger.info({ sessionId, to: senderPhone }, 'Reply sent after typing simulation');
+          logger.info({ sessionId, to: senderPhone }, 'Reply sent');
         }
 
       } catch (error) {
         logger.error({ error: error.message, sessionId }, 'Failed to process message');
         
-        // Optional: Send error message to user
         if (error.code === 'ECONNABORTED') {
           await sock.sendMessage(senderJid, { 
             text: '⏰ Server is busy. Please try again in a moment.' 
-          });
+          }).catch(e => logger.error(e.message));
         }
       }
     }
@@ -219,7 +219,6 @@ async function startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCal
 
 // ========== API ROUTES ==========
 
-// 1. Session शुरू करें
 app.post('/sessions/start', requireApiKey, async (req, res) => {
   const { sessionId, tenantPhoneNumber, callbackUrl, statusCallbackUrl } = req.body;
   
@@ -229,7 +228,6 @@ app.post('/sessions/start', requireApiKey, async (req, res) => {
     });
   }
 
-  // Old session delete करें अगर है
   const existing = sessions.get(sessionId);
   if (existing?.socket) {
     try { await existing.socket.logout(); } catch {}
@@ -238,8 +236,6 @@ app.post('/sessions/start', requireApiKey, async (req, res) => {
 
   try {
     await startSession(sessionId, tenantPhoneNumber, callbackUrl, statusCallbackUrl);
-    
-    // थोड़ा wait करें QR code के लिए
     await delay(2000);
     
     const session = sessions.get(sessionId);
@@ -255,7 +251,6 @@ app.post('/sessions/start', requireApiKey, async (req, res) => {
   }
 });
 
-// 2. Session status check करें
 app.get('/sessions/:sessionId/status', requireApiKey, (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) {
@@ -268,7 +263,6 @@ app.get('/sessions/:sessionId/status', requireApiKey, (req, res) => {
   });
 });
 
-// 3. Session disconnect करें
 app.post('/sessions/:sessionId/disconnect', requireApiKey, async (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) {
@@ -284,7 +278,6 @@ app.post('/sessions/:sessionId/disconnect', requireApiKey, async (req, res) => {
   }
 });
 
-// 4. Manually message भेजें
 app.post('/messages/send', requireApiKey, async (req, res) => {
   const { sessionId, to, message } = req.body;
   
@@ -296,7 +289,6 @@ app.post('/messages/send', requireApiKey, async (req, res) => {
   const jid = `${to.replace('+', '')}@s.whatsapp.net`;
   
   try {
-    // Typing indicator दिखाएं पहले
     await showTyping(session.socket, jid);
     await session.socket.sendMessage(jid, { text: message });
     res.json({ success: true });
@@ -305,7 +297,6 @@ app.post('/messages/send', requireApiKey, async (req, res) => {
   }
 });
 
-// 5. Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
